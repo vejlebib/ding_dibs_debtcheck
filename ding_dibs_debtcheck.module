@@ -1,0 +1,241 @@
+<?php
+
+/**
+* @file
+* Ding DIBS debt-check
+*/
+
+function ding_dibs_debtcheck_cron(){
+
+  // time must have passed todays ding_dibs_debtcheck_time
+  if ( time() > mktime(variable_get('ding_dibs_debtcheck_time', '00:00')) ) { 
+
+    //check the flag to see if job has run in this period
+    if (variable_get('ding_dibs_debtcheck_runflag', 1)) {
+
+      ding_dibs_debtcheck_check_payments();
+      //set flag = 0 to stop job from running until next period
+      variable_set('ding_dibs_debtcheck_runflag', 0);
+    } 
+  } 
+  else {
+    //set flag = 1 and get ready to run on next CRON
+    variable_set('ding_dibs_debtcheck_runflag', 1);
+    
+    $from_address = variable_get('site_mail', ini_get('sendmail_from'));
+    $message = array(
+      'to' => 'ea@vejlebib.dk',
+      'from' => $from_address,
+      'subject' => 'DIBS check prepared for this period',
+      'body' => 'flag ding_dibs_debtcheck_runflag has been set to prepare for run this period', 
+      'headers' => array( ),
+    );
+    drupal_mail_send($message);
+  }
+}
+
+/**
+ * Implementation of hook_menu().
+ */
+function ding_dibs_debtcheck_menu() {
+  $items = array();
+
+  //need this to create tabs, since there are none beforehand
+  $items['admin/settings/dibs/global'] = array(
+    'title' => 'DIBS modules',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => 1,
+  );
+  
+  $items['admin/settings/dibs/debtcheck'] = array(
+    'title' => t('DIBS debt-check settings'),
+    'description' => t(''),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ding_dibs_debtcheck_admin_settings'),
+    'access arguments' => array('administer dibs settings'),
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 2,
+  );
+  
+  return $items;
+}
+
+/**
+ * administrative settings form 
+ * @return array
+ */
+function ding_dibs_debtcheck_admin_settings() {
+  $form = array();
+
+  $form['ding_dibs_debtcheck_emails'] = array(
+    '#type' => 'textarea',
+    '#title' => t('E-mail recipients'),
+    '#default_value' => variable_get('ding_dibs_debtcheck_emails', variable_get('site_mail', '')),
+    '#rows' => 2,
+    '#description' => t("
+      A comma-separated list of e-mail recipients to receive notifications from the dibs debt-check module.
+    "),
+    '#required' => TRUE,
+  );
+  
+  $form['ding_dibs_debtcheck_notify_always'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Always notify'),
+    '#default_value' => variable_get('ding_dibs_debtcheck_notify_always', 0),
+    '#description' => t("
+      Optional. If set, notification emails are always sent, whether errors were detected or not. The content of the notification will depend on there being errors or not.
+    "),
+    '#required' => FALSE,
+  );
+  
+  $form['ding_dibs_debtcheck_days'] = array(
+    '#type' => 'select',
+    '#title' => t('Days to check'),
+    '#default_value' => variable_get('ding_dibs_debtcheck_days', 2),
+    '#options' => array(
+      1 => "1",
+      2 => "2",
+      3 => "3",
+      4 => "4",
+      5 => "5",
+      6 => "6",
+      7 => "7",
+      8 => "8",
+      9 => "9",
+      10 => "10"),
+    '#description' => t("
+      Number of days back to check debts.
+    "),
+    '#required' => TRUE,
+  );
+  
+  $form['ding_dibs_debtcheck_time'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Time to run check (HH:MM)'),
+    '#size' => 5,
+    '#maxlength' => 5,
+    '#default_value' => variable_get('ding_dibs_debtcheck_time', '00:00'),
+    '#description' => t("
+      Optional. If provided, debt check will run the first time cron runs after this time. This means that the exact time it runs depends on when cron is set to run.
+    "),
+    '#required' => FALSE,
+  );
+  
+  return system_settings_form($form);
+}
+
+function ding_dibs_debtcheck_check_payments() {
+
+  $forced_email = variable_get('ding_dibs_debtcheck_notify_always', 0);
+
+  $emails = array();
+  $ding_dibs_debtcheck_emails = variable_get('ding_dibs_debtcheck_emails', variable_get('site_mail', ''));
+  foreach( explode(',', $ding_dibs_debtcheck_emails) as $email){
+    if (valid_email_address($email)) {
+      $emails[] = $email;
+    }
+  }
+  
+  $day_to_check = variable_get('ding_dibs_debtcheck_days', 2);
+  if(!is_numeric($day_to_check)) {
+    return;
+  }
+
+  $max_error_in_row = 4;
+
+  $client = alma_client();
+  if (!$client) {
+    return;
+  }
+  
+  // Construct sql-query. Note the sorting are desc so errorcounter are calculating correct
+  // The reason are that the data from the librarysystem/alma are only keept for a certain time
+  $sqlresult = db_query("SELECT payment_order_id, 
+                                payment_price, 
+                                payment_time, 
+                                params 
+                         FROM dibs_transactions 
+                         WHERE payment_status=1 
+                         AND UNIX_TIMESTAMP()-UNIX_TIMESTAMP(payment_time)<%d 
+                         ORDER BY payment_time DESC;", 
+                         $day_to_check * 86400 );
+
+  $payments = array();
+  while ($pay = db_fetch_array($sqlresult)) {
+    $payments[] = $pay;
+  }
+  
+  $errorcounter = 0;
+  $errors = array();
+  foreach ($payments as $pay) {
+
+    //if($do_print) print $pay['payment_order_id'] . ' ';
+
+    $response = $client->request('patron/payment/confirmation', array('orderId' => $pay['payment_order_id']));
+
+    $domlist = $response->getElementsByTagName('amount');
+    $value = 0;
+    if ( $domlist->length == 1 ) {
+      $value = floatval(trim($domlist->item(0)->getAttribute('value')));
+    }
+    // compare the paid amount with the data from the library system
+    if ( floatval($pay['payment_price']) != $value ) {
+     
+      $params = unserialize($pay['params']);
+      sort($params['selected_debts']);
+
+      $result  = $pay['payment_time'] . "\n";
+      $result .= 'orderid: ' . $pay['payment_order_id'] . "\n"; 
+      $result .= 'ddelibra: ' . implode(',', $params['selected_debts']) . "\n";
+      $result .= 'dibs: ' . $pay['payment_price'] . "\n";
+      $result .= 'alma: ' . $value . ( $value > 0 ? ' (possibly error in alma)' : '' ) . "\n";
+      $result .= 'parturl: ' . 'patron/payments/add?' . http_build_query( array('debts' => implode(',', array_filter( $params['selected_debts']) ),  'orderId' => $pay['payment_order_id']), '', '&') . "\n";
+
+      //if($do_print) print "ERROR\n" . $result . "\n";
+
+      $errors[] = $result;
+
+      $errorcounter++;
+    } else {
+      //if($do_print) print "OK " . $pay['payment_time'] . " $value\n";
+      $errorcounter = 0;
+    }
+
+    if( $errorcounter >= $max_error_in_row ) {
+      // drop the extra errors
+      $errors = array_slice( $errors, 0, -$max_error_in_row);
+      $errors[] = "NOTE: at least $max_error_in_row errors in a row - possibly no data in library system.\n";
+      break;
+    }
+    usleep( 500000 );//dont misuse alma
+  }
+  
+  if(!empty($emails) && (!empty($errors) || $forced_email)) {
+    
+    $check_start_time = date('j. M. Y H:m', (time()-($day_to_check*86400)));
+    
+    $subject = 'DIBS check of payments ';
+    $body = "** DIBS check of payments **\n";
+    $body .= count($payments) . ' payments from last ' . $day_to_check . " days are checked\n";
+    $body .= "(the period between " . $check_start_time . " and " . date('j. M. Y H:m') .")\n\n";
+    
+    
+    if(empty($errors)){
+      $subject .= 'OK';
+      $body .= 'All payments checked out OK.';
+    } else {
+      $subject .= 'ERROR';
+      $body .= "The following payments needs to be checked manually\n\n" . implode("\n", $errors);
+    }
+    
+    $from_address = variable_get('site_mail', ini_get('sendmail_from'));
+    $message = array(
+    'to' => implode(',', $emails),
+    'from' => $from_address,
+    'subject' => $subject,
+    'body' => $body, 
+    'headers' => array( ),
+    );
+    drupal_mail_send($message);
+  }
+}

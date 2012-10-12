@@ -1,0 +1,8 @@
+name = Ding Dibs Debt-check
+description = Daily checks of the payments in from the DIBS payment gateway
+php = 5.2
+core = 6.x
+package = Ding!
+dependencies[] = dibs
+dependencies[] = ding_dibs
+
